@@ -1,0 +1,96 @@
+{
+  "tools": [
+    {
+      "name": "email.test_connection",
+      "description": "Validate IMAP connectivity and credentials.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "host": { "type": "string" },
+          "port": { "type": "integer" },
+          "username": { "type": "string" },
+          "password": { "type": "string" },
+          "mailbox": { "type": "string", "default": "INBOX" }
+        },
+        "required": ["host", "port", "username", "password"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean" },
+          "message": { "type": "string" }
+        },
+        "required": ["ok", "message"]
+      }
+    },
+    {
+      "name": "email.fetch_messages",
+      "description": "Fetch recent emails including subject/body and parsed text from PDF, DOCX, CSV, XLSX attachments.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "host": { "type": "string" },
+          "port": { "type": "integer" },
+          "username": { "type": "string" },
+          "password": { "type": "string" },
+          "mailbox": { "type": "string", "default": "INBOX" },
+          "window_days": { "type": "integer", "default": 30 },
+          "max_messages": { "type": "integer", "default": 200 },
+          "target_to_address": { "type": "string" }
+        },
+        "required": ["host", "port", "username", "password"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "messages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "message_id": { "type": "string" },
+                "date": { "type": "string" },
+                "from_address": { "type": "string" },
+                "to_address": { "type": "string" },
+                "cc": { "type": "string" },
+                "subject": { "type": "string" },
+                "snippet": { "type": "string" },
+                "body": { "type": "string" },
+                "raw_headers": { "type": "string" },
+                "attachments_summary": {
+                  "type": "array",
+                  "items": { "type": "string" }
+                },
+                "attachments": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "filename": { "type": "string" },
+                      "content_type": { "type": "string" },
+                      "extracted_text": { "type": "string" },
+                      "extracted": { "type": "boolean" }
+                    },
+                    "required": ["filename", "content_type", "extracted_text", "extracted"]
+                  }
+                }
+              },
+              "required": ["message_id", "subject", "snippet", "body", "attachments_summary", "attachments"]
+            }
+          },
+          "count": { "type": "integer" },
+          "filter_applied": { "type": "boolean" },
+          "debug": {
+            "type": "object",
+            "properties": {
+              "candidate_count": { "type": "integer" },
+              "post_filter_count": { "type": "integer" },
+              "mailbox": { "type": "string" }
+            }
+          }
+        },
+        "required": ["messages", "count", "filter_applied"]
+      }
+    }
+  ]
+}

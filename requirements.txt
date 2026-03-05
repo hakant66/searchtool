@@ -1,0 +1,11 @@
+PySide6
+Pillow
+numpy
+watchdog
+python-docx
+keyring
+pytest
+openai
+python-dotenv
+openpyxl
+pypdf
