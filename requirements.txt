@@ -9,3 +9,11 @@ openai
 python-dotenv
 openpyxl
 pypdf
+PyMuPDF
+fastapi
+uvicorn
+python-multipart
+jinja2
+sqlalchemy
+alembic
+psycopg[binary]
