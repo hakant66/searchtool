@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from webapp.receipt_extractor import _match_item_images
+from webapp.receipt_extractor import (
+    _build_openai_content_parts,
+    _build_receipt_items_prompt,
+    _build_receipt_summary_prompt,
+    _match_item_images,
+)
 
 
 def test_match_item_images_uses_text_anchors():
@@ -37,3 +42,29 @@ def test_match_item_images_falls_back_when_no_images():
         fallback_image=b"fallback",
     )
     assert assigned == [b"fallback"]
+
+
+def test_build_openai_content_parts_supports_image_only_pdf():
+    content_parts, first_image = _build_openai_content_parts(
+        filename="receipt.pdf",
+        extracted_text="",
+        vision_images=[
+            {"blob": b"img-1", "mime": "image/png"},
+            {"blob": b"img-2", "mime": "image/jpeg"},
+        ],
+    )
+
+    assert "no extractable text layer" in content_parts[0]["text"].lower()
+    assert [part["type"] for part in content_parts] == ["input_text", "input_image", "input_image"]
+    assert first_image == content_parts[1]["image_url"]
+
+
+def test_receipt_summary_prompt_avoids_items():
+    prompt = _build_receipt_summary_prompt()
+    assert "do not return items" in prompt.lower()
+
+
+def test_receipt_items_prompt_requests_product_cards_only():
+    prompt = _build_receipt_items_prompt(page_number=2, page_count=4)
+    assert "product card" in prompt.lower()
+    assert "ignore headers, footers, payment method" in prompt.lower()

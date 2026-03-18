@@ -349,6 +349,202 @@ def _normalize_count(raw: Any) -> int:
         return 1
 
 
+def _build_openai_receipt_prompt(*, filename: str, extracted_text: str) -> str:
+    instruction = (
+        "Extract shopping receipt fields and return strict JSON only with this structure: "
+        "{marketplace, order_id, order_time, payment_method, items:[{item_name,item_info,item_cost,item_count,item_trader}]}. "
+        "Keep values exactly as shown in source when possible. item_count must be numeric if present. "
+        "If a field is missing, use empty string; if items are missing, return an empty list."
+    )
+    if extracted_text.strip():
+        return f"Filename: {filename}\n\n{instruction}\n\nPDF text:\n{extracted_text[:24000]}"
+    return (
+        f"Filename: {filename}\n\n{instruction}\n\n"
+        "This PDF has no extractable text layer. Read the receipt from the provided page images."
+    )
+
+
+def _build_openai_content_parts(
+    *,
+    filename: str,
+    extracted_text: str,
+    vision_images: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str | None]:
+    import base64
+
+    user_text = _build_openai_receipt_prompt(filename=filename, extracted_text=extracted_text)
+    content_parts: list[dict[str, Any]] = [{"type": "input_text", "text": user_text}]
+    first_image_data_url: str | None = None
+
+    for image in vision_images:
+        blob = bytes(image.get("blob") or b"")
+        if not blob:
+            continue
+        encoded = base64.b64encode(blob).decode("ascii")
+        image_data_url = f"data:{str(image.get('mime') or 'image/jpeg')};base64,{encoded}"
+        if first_image_data_url is None:
+            first_image_data_url = image_data_url
+        content_parts.append(
+            {
+                "type": "input_image",
+                "image_url": image_data_url,
+            }
+        )
+
+    return content_parts, first_image_data_url
+
+
+def _extract_with_openai(
+    *,
+    client: Any,
+    model_name: str,
+    prompt_text: str,
+    image_data_urls: list[str] | None = None,
+) -> dict[str, Any]:
+    content_parts: list[dict[str, Any]] = [{"type": "input_text", "text": prompt_text}]
+    for image_data_url in image_data_urls or []:
+        content_parts.append({"type": "input_image", "image_url": image_data_url})
+
+    parsed: dict[str, Any] = {}
+    errors: list[str] = []
+    try:
+        parsed = _openai_extract_with_responses(
+            client=client,
+            model_name=model_name,
+            content_parts=content_parts,
+        )
+    except Exception as exc:
+        errors.append(f"responses: {exc}")
+
+    if not parsed:
+        fallback_image = image_data_urls[0] if image_data_urls else None
+        try:
+            parsed = _openai_extract_with_chat_completions(
+                client=client,
+                model_name=model_name,
+                user_text=prompt_text,
+                image_data_url=fallback_image,
+            )
+        except Exception as exc:
+            errors.append(f"chat.completions: {exc}")
+
+    if parsed:
+        return parsed
+
+    detail = f" ({'; '.join(errors)})" if errors else ""
+    raise ReceiptExtractionError(f"OpenAI response is not valid JSON{detail}")
+
+
+def _build_receipt_summary_prompt() -> str:
+    return (
+        "This image is the order summary page from a shopping receipt. "
+        "Return strict JSON only with this structure: "
+        "{marketplace, order_id, order_time, payment_method}. "
+        "Use the exact values shown. If a field is missing, return an empty string. "
+        "Do not return items."
+    )
+
+
+def _build_receipt_items_prompt(*, page_number: int, page_count: int) -> str:
+    return (
+        f"This image is page {page_number} of {page_count} from a shopping receipt. "
+        "Extract each purchased product card visible on this page and return strict JSON only as "
+        "{items:[{item_name,item_info,item_cost,item_count,item_trader}]}. "
+        "Rules: one object per visible product card; item_name is the full product title; "
+        "item_info is the variant/color/style line under the title; item_cost is the price on the right; "
+        "item_count is the numeric quantity from markers such as x2 or x3; "
+        "item_trader is the seller shown after 'Sold by trader'. "
+        "Ignore headers, footers, payment method, subtotal, shipping, coupons, tax, and order summary details. "
+        "If no product cards are visible on this page, return an empty items list."
+    )
+
+
+def _image_to_data_url(image: dict[str, Any]) -> str | None:
+    import base64
+
+    blob = bytes(image.get("blob") or b"")
+    if not blob:
+        return None
+    mime = str(image.get("mime") or "image/jpeg")
+    encoded = base64.b64encode(blob).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _normalize_items_with_page_images(
+    *,
+    items: list[dict[str, Any]],
+    fallback_image: bytes | None,
+) -> list[dict[str, Any]]:
+    normalized_items: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_image_bytes = item.get("item_image_bytes")
+        normalized_items.append(
+            {
+                "item_name": str(item.get("item_name", "") or ""),
+                "item_info": str(item.get("item_info", "") or ""),
+                "item_cost": str(item.get("item_cost", "") or ""),
+                "item_count": _normalize_count(item.get("item_count", 1)),
+                "item_trader": str(item.get("item_trader", "") or ""),
+                "item_image_bytes": bytes(item_image_bytes)
+                if isinstance(item_image_bytes, (bytes, bytearray))
+                else fallback_image,
+            }
+        )
+    return normalized_items
+
+
+def _extract_receipt_from_image_pages(
+    *,
+    client: Any,
+    model_name: str,
+    filename: str,
+    raw_images: list[dict[str, Any]],
+) -> dict[str, Any]:
+    first_image_bytes = bytes(raw_images[0]["blob"]) if raw_images else None
+    summary_page = raw_images[0] if raw_images else None
+    summary_data_url = _image_to_data_url(summary_page) if summary_page else None
+    summary = (
+        _extract_with_openai(
+            client=client,
+            model_name=model_name,
+            prompt_text=f"Filename: {filename}\n\n{_build_receipt_summary_prompt()}",
+            image_data_urls=[summary_data_url] if summary_data_url else [],
+        )
+        if summary_data_url
+        else {}
+    )
+
+    extracted_items: list[dict[str, Any]] = []
+    page_count = len(raw_images)
+    for page_number, image in enumerate(raw_images, start=1):
+        image_data_url = _image_to_data_url(image)
+        if not image_data_url:
+            continue
+        page_result = _extract_with_openai(
+            client=client,
+            model_name=model_name,
+            prompt_text=f"Filename: {filename}\n\n{_build_receipt_items_prompt(page_number=page_number, page_count=page_count)}",
+            image_data_urls=[image_data_url],
+        )
+        for item in page_result.get("items") if isinstance(page_result.get("items"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_copy = dict(item)
+            item_copy["item_image_bytes"] = bytes(image["blob"])
+            extracted_items.append(item_copy)
+
+    return {
+        "marketplace": str(summary.get("marketplace", "") or ""),
+        "order_id": str(summary.get("order_id", "") or ""),
+        "order_time": str(summary.get("order_time", "") or ""),
+        "payment_method": str(summary.get("payment_method", "") or ""),
+        "items": _normalize_items_with_page_images(items=extracted_items, fallback_image=first_image_bytes),
+        "first_image_bytes": first_image_bytes,
+    }
+
+
 def extract_receipt_fields_with_openai(
     *,
     pdf_bytes: bytes,
@@ -363,7 +559,7 @@ def extract_receipt_fields_with_openai(
         raise ReceiptExtractionError("openai package is not installed")
 
     extracted_text, raw_images, text_lines = _extract_pdf_text_and_images(pdf_bytes)
-    if not extracted_text:
+    if not extracted_text and not raw_images:
         raise ReceiptExtractionError("No extractable text found in the PDF")
 
     min_item_image_bytes = int(os.getenv("RECEIPT_MIN_ITEM_IMAGE_BYTES", "6000"))
@@ -371,63 +567,29 @@ def extract_receipt_fields_with_openai(
     if not candidate_images and raw_images:
         candidate_images = raw_images
     first_image_bytes = bytes(candidate_images[0]["blob"]) if candidate_images else None
-    first_image_mime = str(candidate_images[0]["mime"]) if candidate_images else None
-
-    instruction = (
-        "Extract shopping receipt fields and return strict JSON only with this structure: "
-        "{marketplace, order_id, order_time, payment_method, items:[{item_name,item_info,item_cost,item_count,item_trader}]}. "
-        "Keep values exactly as shown in source when possible. item_count must be numeric if present. "
-        "If a field is missing, use empty string; if items are missing, return an empty list."
-    )
-
-    user_text = f"Filename: {filename}\n\n{instruction}\n\nPDF text:\n{extracted_text[:24000]}"
-
-    content_parts: list[dict[str, Any]] = [
-        {
-            "type": "input_text",
-            "text": user_text,
-        }
-    ]
-    image_data_url: str | None = None
-    if first_image_bytes:
-        import base64
-
-        encoded = base64.b64encode(first_image_bytes).decode("ascii")
-        image_data_url = f"data:{first_image_mime or 'image/jpeg'};base64,{encoded}"
-        content_parts.append(
-            {
-                "type": "input_image",
-                "image_url": image_data_url,
-            }
-        )
-
     client = OpenAI(api_key=key, timeout=90, max_retries=1)
     model_name = model or os.getenv("RECEIPT_OPENAI_MODEL", "gpt-4.1-mini")
-    parsed: dict[str, Any] = {}
-    errors: list[str] = []
-    try:
-        parsed = _openai_extract_with_responses(
+    if not extracted_text.strip() and candidate_images:
+        return _extract_receipt_from_image_pages(
             client=client,
             model_name=model_name,
-            content_parts=content_parts,
+            filename=filename,
+            raw_images=candidate_images,
         )
-    except Exception as exc:
-        errors.append(f"responses: {exc}")
 
-    if not parsed:
-        try:
-            parsed = _openai_extract_with_chat_completions(
-                client=client,
-                model_name=model_name,
-                user_text=user_text,
-                image_data_url=image_data_url,
-            )
-        except Exception as exc:
-            errors.append(f"chat.completions: {exc}")
-
-    if not parsed:
-        detail = f" ({'; '.join(errors)})" if errors else ""
-        raise ReceiptExtractionError(f"OpenAI response is not valid JSON{detail}")
+    vision_images = candidate_images[:6]
+    content_parts, image_data_url = _build_openai_content_parts(
+        filename=filename,
+        extracted_text=extracted_text,
+        vision_images=vision_images,
+    )
+    user_text = _build_openai_receipt_prompt(filename=filename, extracted_text=extracted_text)
+    parsed = _extract_with_openai(
+        client=client,
+        model_name=model_name,
+        prompt_text=user_text,
+        image_data_urls=[image_data_url] if image_data_url else [],
+    )
 
     items = parsed.get("items") if isinstance(parsed.get("items"), list) else []
     dict_items = [x for x in items if isinstance(x, dict)]
@@ -442,18 +604,12 @@ def extract_receipt_fields_with_openai(
     for item in items:
         if not isinstance(item, dict):
             continue
-        item_image_bytes = image_assignments[image_idx] if image_idx < len(image_assignments) else first_image_bytes
-        image_idx += 1
-        normalized_items.append(
-            {
-                "item_name": str(item.get("item_name", "") or ""),
-                "item_info": str(item.get("item_info", "") or ""),
-                "item_cost": str(item.get("item_cost", "") or ""),
-                "item_count": _normalize_count(item.get("item_count", 1)),
-                "item_trader": str(item.get("item_trader", "") or ""),
-                "item_image_bytes": item_image_bytes,
-            }
+        item_copy = dict(item)
+        item_copy["item_image_bytes"] = (
+            image_assignments[image_idx] if image_idx < len(image_assignments) else first_image_bytes
         )
+        image_idx += 1
+        normalized_items.extend(_normalize_items_with_page_images(items=[item_copy], fallback_image=first_image_bytes))
 
     return {
         "marketplace": str(parsed.get("marketplace", "") or ""),
