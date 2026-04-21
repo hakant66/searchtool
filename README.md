@@ -31,6 +31,81 @@ pip install -r requirements.txt
 python -m sold_item_finder.app
 ```
 
+## Web UI (Docker)
+
+The project also includes a lightweight web UI powered by FastAPI.
+
+### Run locally (without Docker)
+
+```bash
+uvicorn webapp.main:app --reload --port 8000
+```
+
+Open: `http://localhost:8000`
+
+### Run with Docker Compose
+
+Set your Google Drive synced root path before starting:
+
+```bash
+export GOOGLE_DRIVE_SYNC_PATH="$HOME/Library/CloudStorage"
+docker compose up --build
+```
+
+Open: `http://localhost:8000`
+
+Notes:
+
+- Container persists index DB in `./data/index.db`
+- In container, mounted Google Drive root is available at `/mnt/google-drive`
+- For OpenAI features in web mode, export `OPENAI_API_KEY` before `docker compose up`
+- Web UI supports folder selection via:
+  - quick path shortcuts
+  - **Browse Folders** button (lists subfolders, click to select)
+
+### Receipt Parser UI (OpenAI + PostgreSQL + Alembic)
+
+New web page: `http://localhost:8001/receipts`
+
+Flow:
+
+- Upload a `.pdf` receipt from the UI
+- Extract receipt fields via OpenAI
+- Insert extracted item rows into `receipt_items` table
+- View the receipt table with the same column order as the XLSX export
+- See the imported thumbnail image as the first column in the UI
+- Download `.xlsx` export with:
+  - a `receipt_items` sheet using the same 14-column layout as the GUI
+  - an `item_images` sheet containing the embedded image thumbnails
+
+Receipt column order:
+
+1. `Item No`
+2. `SKU`
+3. `Marketplace`
+4. `Type`
+5. `Video`
+6. `Bought at`
+7. `Sell at`
+8. `Size`
+9. `Count`
+10. `Item name`
+11. `Link`
+12. `item_trader`
+13. `payment_method`
+14. `Order ID`
+
+Required env vars for receipt parsing:
+
+- `OPENAI_API_KEY` (for LLM extraction)
+- `RECEIPT_DATABASE_URL` (PostgreSQL SQLAlchemy URL, e.g. `postgresql+psycopg://searchtool:searchtool@localhost:5433/searchtool`)
+
+Apply DB migrations:
+
+```bash
+alembic upgrade head
+```
+
 ## Google Drive Folder
 
 In the **Image Search** tab, set the root folder to your local synced Google Drive folder. Common path example:
